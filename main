@@ -1,0 +1,87 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "NicoModBus.h"
+
+// WiFi
+const char* ssid = "HugoPacoY";
+const char* password = "32950002";
+
+// ThingsBoard
+const char* tb_server = "demo.thingsboard.io";
+const int tb_port = 1883;
+const char* tb_token = "2dkwSGsuUQYaMfpJPUGB";  // 🔁 Reemplazá con tu Access Token
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+// Modbus
+IPAddress moxaIP(192, 168, 1, 150);
+NicoModBus mb;
+bool diStates[12];
+
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("🔄 Conectando a ThingsBoard...");
+    if (mqttClient.connect("ESP32Cliente", tb_token, NULL)) {
+      Serial.println("✅ Conectado a ThingsBoard MQTT");
+    } else {
+      Serial.print("❌ Error MQTT: ");
+      Serial.println(mqttClient.state());
+      delay(2000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando a WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi conectado");
+
+  mqttClient.setServer(tb_server, tb_port);
+
+  // Conexión Modbus
+  if (!mb.connect(moxaIP)) {
+    Serial.println("❌ Falló conexión Modbus");
+    while (true) delay(500);
+  }
+}
+
+void loop() {
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
+  if (mb.readDiscreteInputs(0, diStates, 12)) {
+    Serial.println("✅ Lectura Modbus exitosa. Enviando a ThingsBoard...");
+
+    // Armar JSON para ThingsBoard
+    DynamicJsonDocument json(512);
+    for (int i = 0; i < 12; i++) {
+      String key = "DI" + String(i);
+      json[key] = diStates[i];
+    }
+
+    char payload[256];
+    serializeJson(json, payload);
+
+    // Publicar a ThingsBoard
+    mqttClient.publish("v1/devices/me/telemetry", payload);
+    Serial.println("📤 Payload enviado:");
+    Serial.println(payload);
+  } else {
+    Serial.println("❌ Falló lectura Modbus, intentando reconexión...");
+    mb.disconnect();
+    delay(1000);
+    mb.connect(moxaIP);
+  }
+
+  delay(5000);  // Esperar 5 segundos entre ciclos
+}
