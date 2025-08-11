@@ -1,0 +1,93 @@
+function doPost(e) {
+  // Verificar si es ejecución manual
+  if (typeof e === 'undefined') {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'error',
+      message: "Ejecuta testDoPost() para pruebas"
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Intentar obtener el bloqueo
+  
+  var lock = LockService.getScriptLock();
+  try {
+    // Esperar máximo 30 segundos para obtener el bloqueo
+    lock.waitLock(30000);
+    
+    // Obtener hoja
+    var sheetName = 'Registro_ThingsBoard';
+    var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = spreadsheet.getSheetByName(sheetName) || spreadsheet.insertSheet(sheetName);
+    
+    // Configurar encabezados si es nueva hoja
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow(['Timestamp', 'Entrada', 'Estado', 'Valor Binario']);
+      sheet.getRange("A1:D1").setFontWeight("bold");
+    }
+
+    // Obtener datos
+    var payload = JSON.parse(e.postData.contents);
+    var timestamp = Utilities.formatDate(new Date(), "GMT-3", "yyyy-MM-dd HH:mm:ss");
+    var savedEntries = 0;
+
+    // Procesar solo entradas DI*
+    for (var key in payload) {
+      if (key.startsWith('DI')) {
+        var value = payload[key];
+        sheet.appendRow([
+          timestamp,
+          key,
+          value ? "ACTIVO" : "INACTIVO",
+          value ? "1" : "0"
+        ]);
+        savedEntries++;
+      }
+    }
+
+    // Autoajustar columnas
+    sheet.autoResizeColumns(1, 4);
+    
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'success',
+      savedEntries: savedEntries
+    })).setMimeType(ContentService.MimeType.JSON);
+
+  } catch (error) {
+    Logger.log("Error: " + error.message);
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'error',
+      message: error.message
+    })).setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    // Liberar el bloqueo siempre, incluso si hay error
+    lock.releaseLock();
+  }
+}
+
+function testDoPost() {
+  // Datos de prueba simulados
+  var testData = {
+    DI0: false,
+    DI1: true,
+    DI2: false,
+    DI3: false,
+    DI4: true,
+    DI5: false,
+    DI6: false,
+    DI7: true,
+    DI10: false,
+    DI11: true,
+    otherData: "ignored" // Este dato será filtrado
+  };
+  
+  var mockRequest = {
+    postData: {
+      contents: JSON.stringify(testData),
+      type: "application/json"
+    }
+  };
+  
+  var response = doPost(mockRequest);
+  Logger.log(response.getContent());
+  return "Prueba completada. Verifica la hoja.";
+}
