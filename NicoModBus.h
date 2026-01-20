@@ -1,8 +1,8 @@
-// NicoModBus.h - Biblioteca simplificada para Modbus TCP
+// ModBus.h - Biblioteca simplificada para Modbus TCP
 //#include <ESP8266WiFi.h>
 //#include <WiFiClient.h>
 
-class NicoModBus {
+class ModBus {
 private:
     WiFiClient client;
     IPAddress serverIP;
@@ -10,7 +10,7 @@ private:
     uint8_t unitID;
     
 public:
-    NicoModBus() : serverPort(502), unitID(1) {}
+    ModBus() : serverPort(502), unitID(1) {}
     
     bool connect(IPAddress ip, uint16_t port = 502) {
         serverIP = ip;
