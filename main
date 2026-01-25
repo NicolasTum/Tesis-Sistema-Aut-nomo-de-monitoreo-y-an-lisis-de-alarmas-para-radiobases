@@ -1,87 +1,707 @@
+// Codigo Pilar Marinez y Nicolás Tumaián
+// Pilar - XXXXX , Nicolás 251664
+// Tesis para Ingeniería eléctrica en electrónica y en telecominicaciones para la Universidad ORT
+//
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include "NicoModBus.h"
+#include "ModBus.h"
+#include <math.h>
+#include <limits.h>
+#include <time.h>
+#include "TelemetryRec.h" 
 
-// WiFi
-const char* ssid = "HugoPacoY";
-const char* password = "32950002";
+// ===== EMAIL ALERTS (ESP Mail Client) =====
+#include <ESP_Mail_Client.h>
 
-// ThingsBoard
+// ===== [NUEVO] LittleFS para persistencia =====
+#include <LittleFS.h>
+
+// ===== WiFi =====
+const char* ssid     = "Proyecto";
+const char* password = "asdasd123";
+
+// ===== [NUEVO] LED indicador WiFi =====
+// Uso GPIO2 (en muchas ESP32 DevKit es el LED integrado). No choca con 34/35.
+const int PIN_WIFI_LED = 2;
+
+// ===== ThingsBoard (MQTT) =====
 const char* tb_server = "demo.thingsboard.io";
-const int tb_port = 1883;
-const char* tb_token = "2dkwSGsuUQYaMfpJPUGB";  // 🔁 Reemplazá con tu Access Token
+const int   tb_port   = 1883;
+const char* tb_token  = "2dkwSGsuUQYaMfpJPUGB";
 
-WiFiClient wifiClient;
+WiFiClient   wifiClient;
 PubSubClient mqttClient(wifiClient);
 
-// Modbus
+// ===== Modbus (MOXA) =====
 IPAddress moxaIP(192, 168, 1, 150);
-NicoModBus mb;
-bool diStates[12];
 
-void reconnectMQTT() {
-  while (!mqttClient.connected()) {
-    Serial.print("🔄 Conectando a ThingsBoard...");
-    if (mqttClient.connect("ESP32Cliente", tb_token, NULL)) {
-      Serial.println("✅ Conectado a ThingsBoard MQTT");
-    } else {
-      Serial.print("❌ Error MQTT: ");
-      Serial.println(mqttClient.state());
-      delay(2000);
-    }
+ModBus mb;
+bool diStates[12];
+bool lastDiStates[12];
+
+// Índice del DI que corresponde a la puerta
+const int DOOR_DI_INDEX = 0;
+
+// ===== Pines =====
+const int PIN_LM35  = 35;   // ADC LM35
+const int PIN_CT    = 34;   // ADC CT
+
+// ===== Telemetría =====
+unsigned long lastHourlySend = 0;
+const unsigned long hourlyInterval = 3600000UL;  // 1 hora
+
+// ===== Temperatura (LM35) =====
+const int   LM_NUM_SAMPLES = 32;
+const float LM_EMA_ALPHA   = 0.20f;
+float ema_mV = 0.0f;
+float TEMP_GAIN    = 1.000f;
+float TEMP_OFFSETC = 0.0f;
+
+float g_TempC     = 0.0f;
+int   g_TempC_int = 0;
+int   lastSent_TempC_int = INT_MIN;
+
+const int TEMP_ALERT_HIGH  = 35;
+const int TEMP_ALERT_RESET = 33;
+bool tempAlertActive = false;
+
+// ===== Corriente (CT) + Funciona =====
+const float AMPS_PER_V = 100.0f;
+float K_GAIN = 2.0f;
+
+const float LINE_V_RMS = 230.0f;
+float PF_ASSUMED = 1.0f;
+
+const float VRMS0_FIXED     = 0.035f;
+const float DEADBAND_MIN_V  = (0.20f * VRMS0_FIXED > 0.003f) ? (0.20f * VRMS0_FIXED) : 0.003f;
+const float EMA_ALPHA_CT    = 0.25f;
+float ema_Vrms_corr         = 0.0f;
+float last_block_Vrms_corr  = 0.0f;
+const float DROP_RESET      = 0.35f;
+
+const float VFS   = 3.3f;
+const float SCALE = VFS / 4095.0f;
+
+const float ZERO_EPS_A      = 0.50f;
+const float SEND_DELTA_IRMS_A = 5.0f;
+
+float g_Irms_A        = 0.0f;
+float g_Irms_sent_A   = 0.0f;
+float lastSent_Irms_A = NAN;
+bool  funciona_flag   = false;
+
+bool lastNowIsZero = true;
+bool lastDoorState = false;
+
+// ===== Nombre del sitio para emails =====
+const char* SITE_NAME = "Radiobase ORT";
+
+// ===== Configuración EMAIL ALERTS (SMTP Gmail) =====
+#define SMTP_HOST "smtp.gmail.com"
+#define SMTP_PORT 465
+
+#define AUTHOR_EMAIL    "alertastesismartineztumaian@gmail.com"
+#define AUTHOR_PASSWORD "yuykewepcozzaqmy"
+#define RECIPIENT_EMAIL "tesismartineztumaian@gmail.com"
+
+SMTPSession smtp;
+Session_Config mailConfig;
+
+void smtpCallback(SMTP_Status status) {
+  Serial.println(status.info());
+  if (status.success()) {
+    Serial.println("----------------");
+    Serial.printf("Message sent success: %d\n", status.completedCount());
+    Serial.printf("Message sent failed: %d\n", status.failedCount());
+    Serial.println("----------------\n");
+    smtp.sendingResult.clear();
   }
 }
+
+bool sendAlertEmail(const String& subject, const String& body) {
+  if (!smtp.connected()) {
+    if (!smtp.connect(&mailConfig)) {
+      Serial.printf("SMTP connect error. Status=%d, Code=%d, Reason=%s\n",
+        smtp.statusCode(), smtp.errorCode(), smtp.errorReason().c_str());
+      return false;
+    }
+  }
+
+  SMTP_Message msg;
+  msg.sender.name  = F("ESP32 Alarmas");
+  msg.sender.email = AUTHOR_EMAIL;
+  msg.subject      = subject.c_str();
+  msg.addRecipient(F("Tesis"), RECIPIENT_EMAIL);
+
+  msg.text.content = body.c_str();
+  msg.text.charSet = "utf-8";
+  msg.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+  msg.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_normal;
+  msg.response.notify = esp_mail_smtp_notify_success | esp_mail_smtp_notify_failure;
+
+  bool ok = MailClient.sendMail(&smtp, &msg);
+  if (!ok) {
+    Serial.printf("sendMail ERROR. Status=%d, Code=%d, Reason=%s\n",
+      smtp.statusCode(), smtp.errorCode(), smtp.errorReason().c_str());
+  }
+  return ok;
+}
+
+// =====================================================
+// ===== [NUEVO] STORE-AND-FORWARD (RAM + LittleFS) =====
+// =====================================================
+
+static const char* LOG_FILE = "/tb_offline.jsonl";
+static const char* TMP_FILE = "/tb_offline.tmp";
+
+// Límite de backlog en flash (para no crecer infinito)
+static const size_t MAX_LOG_BYTES = 120 * 1024; // 120 KB (ajustable)
+
+// ===== Buffer RAM (100 registros) =====
+#define RAM_BUF_MAX 100
+
+TelemetryRec ramBuf[RAM_BUF_MAX];
+uint16_t ramHead = 0, ramTail = 0, ramCount = 0;
+
+bool ramPush(const TelemetryRec& r) {
+  if (ramCount >= RAM_BUF_MAX) return false;
+  ramBuf[ramHead] = r;
+  ramHead = (ramHead + 1) % RAM_BUF_MAX;
+  ramCount++;
+  return true;
+}
+bool ramPop(TelemetryRec& r) {
+  if (ramCount == 0) return false;
+  r = ramBuf[ramTail];
+  ramTail = (ramTail + 1) % RAM_BUF_MAX;
+  ramCount--;
+  return true;
+}
+
+uint16_t makeDiMask() {
+  uint16_t m = 0;
+  for (int i = 0; i < 12; i++) if (diStates[i]) m |= (1u << i);
+  return m;
+}
+
+uint32_t getTsNow() {
+  time_t now = time(nullptr);
+  // si parece válido (post 2023), usamos epoch; sino millis()
+  if (now > 1672531200) return (uint32_t)now;
+  return millis();
+}
+
+TelemetryRec makeRecFromCurrent() {
+  TelemetryRec r;
+  r.ts = getTsNow();
+  r.diMask = makeDiMask();
+  r.tempC = (int16_t)g_TempC_int;
+  r.irmsA = g_Irms_sent_A;
+  r.funciona = funciona_flag;
+  return r;
+}
+
+// Publicación con timestamp para ThingsBoard:
+// {"ts":..., "values":{...}}
+bool publishRecTB(const TelemetryRec& r) {
+  DynamicJsonDocument doc(768);
+  doc["ts"] = r.ts;
+  JsonObject values = doc.createNestedObject("values");
+
+  for (int i = 0; i < 12; i++) {
+    String key = "DI" + String(i);
+    values[key] = ((r.diMask >> i) & 1);
+  }
+  values["TempC"]    = r.tempC;
+  values["Irms_A"]   = r.irmsA;
+  values["Funciona"] = r.funciona;
+
+  char payload[768];
+  size_t n = serializeJson(doc, payload, sizeof(payload));
+  bool ok = mqttClient.publish("v1/devices/me/telemetry", payload, n);
+
+  if (ok) {
+    Serial.print("📤 TB OK (hist): ");
+    Serial.println(payload);
+  } else {
+    Serial.println("❌ publishRecTB falló");
+  }
+  return ok;
+}
+
+bool appendRecToFS(const TelemetryRec& r) {
+  if (!LittleFS.begin(true)) {
+    Serial.println("❌ LittleFS no disponible (append falló)");
+    return false;
+  }
+
+  // Control de tamaño
+  File fsize = LittleFS.open(LOG_FILE, "r");
+  if (fsize) {
+    size_t sz = fsize.size();
+    fsize.close();
+    if (sz > MAX_LOG_BYTES) {
+      Serial.println("⚠ LOG excede MAX_LOG_BYTES -> se reinicia (pierde lo más viejo)");
+      LittleFS.remove(LOG_FILE);
+    }
+  }
+
+  File f = LittleFS.open(LOG_FILE, "a");
+  if (!f) {
+    Serial.println("❌ No pude abrir LOG_FILE para append");
+    return false;
+  }
+
+  // JSON compacto por línea
+  StaticJsonDocument<256> doc;
+  doc["ts"] = r.ts;
+  doc["di"] = r.diMask;
+  doc["t"]  = r.tempC;
+  doc["i"]  = r.irmsA;
+  doc["f"]  = r.funciona;
+
+  if (serializeJson(doc, f) == 0) {
+    f.close();
+    Serial.println("❌ serializeJson->FS falló");
+    return false;
+  }
+  f.print("\n");
+  f.close();
+  return true;
+}
+
+bool parseLineToRec(const String& line, TelemetryRec& r) {
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) return false;
+
+  r.ts       = doc["ts"] | 0u;
+  r.diMask   = doc["di"] | 0u;
+  r.tempC    = (int16_t)(doc["t"] | 0);
+  r.irmsA    = doc["i"] | 0.0f;
+  r.funciona = doc["f"] | false;
+  return true;
+}
+
+void enqueueOffline(const TelemetryRec& r) {
+  // Primero RAM; si está lleno -> flash
+  if (!ramPush(r)) {
+    appendRecToFS(r);
+  }
+}
+
+void flushRAM(uint16_t maxPerLoop = 10) {
+  if (!mqttClient.connected()) return;
+
+  TelemetryRec r;
+  uint16_t sent = 0;
+  while (sent < maxPerLoop && ramPop(r)) {
+    if (!publishRecTB(r)) {
+      // si falla, re-encolamos
+      if (!ramPush(r)) appendRecToFS(r);
+      break;
+    }
+    sent++;
+    mqttClient.loop();
+    delay(5);
+  }
+}
+
+void flushFS(uint16_t maxLinesPerLoop = 30) {
+  if (!mqttClient.connected()) return;
+  if (!LittleFS.begin(true)) return;
+  if (!LittleFS.exists(LOG_FILE)) return;
+
+  File in = LittleFS.open(LOG_FILE, "r");
+  if (!in) return;
+
+  File out = LittleFS.open(TMP_FILE, "w");
+  if (!out) { in.close(); return; }
+
+  uint16_t processed = 0;
+
+  while (in.available()) {
+    String line = in.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    TelemetryRec r;
+    if (!parseLineToRec(line, r)) {
+      Serial.println("⚠ Línea corrupta en log, descartada");
+      continue;
+    }
+
+    if (processed >= maxLinesPerLoop) {
+      out.println(line); // dejamos para después
+      continue;
+    }
+
+    if (!publishRecTB(r)) {
+      // si falla, preservamos esta línea y el resto
+      out.println(line);
+      while (in.available()) {
+        String rest = in.readStringUntil('\n');
+        rest.trim();
+        if (rest.length()) out.println(rest);
+      }
+      break;
+    }
+
+    processed++;
+    mqttClient.loop();
+    delay(5);
+  }
+
+  in.close();
+  out.close();
+
+  LittleFS.remove(LOG_FILE);
+  LittleFS.rename(TMP_FILE, LOG_FILE);
+
+  if (processed > 0) Serial.printf("✅ flushFS: enviadas %u líneas\n", processed);
+}
+
+// =====================================================
+// ===== [NUEVO] Conexión NO BLOQUEANTE WiFi/MQTT =======
+// =====================================================
+
+bool ensureWiFi() {
+  static uint32_t lastTry = 0;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(PIN_WIFI_LED, HIGH);
+    return true;
+  }
+
+  digitalWrite(PIN_WIFI_LED, LOW);
+
+  if (millis() - lastTry < 5000) return false;
+  lastTry = millis();
+
+  Serial.println("📡 WiFi caído/no conectado -> reintentando...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
+  return false;
+}
+
+bool ensureMQTT() {
+  static uint32_t lastTry = 0;
+
+  if (mqttClient.connected()) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  if (millis() - lastTry < 3000) return false;
+  lastTry = millis();
+
+  Serial.print("🔄 MQTT reconnect...");
+  bool ok = mqttClient.connect("ESP32Cliente", tb_token, NULL);
+  Serial.println(ok ? "✅" : "❌");
+  return ok;
+}
+
+// ===== Helpers DI =====
+bool checkDIChangesOnly() {
+  for (int i = 0; i < 12; i++) if (diStates[i] != lastDiStates[i]) return true;
+  return false;
+}
+
+// ==== LM35 ====
+uint32_t read_mV_avg(int pin, int n) {
+  uint32_t acc=0;
+  for (int i=0;i<n;i++) {
+    acc += analogReadMilliVolts(pin);
+    if ((i & 0x0F) == 0) mqttClient.loop();
+    delayMicroseconds(200);
+  }
+  return acc/(uint32_t)n;
+}
+void measureLM35() {
+  uint32_t mv = read_mV_avg(PIN_LM35, LM_NUM_SAMPLES);
+  ema_mV = (1.0f - LM_EMA_ALPHA) * ema_mV + LM_EMA_ALPHA * (float)mv;
+  g_TempC = TEMP_GAIN * (ema_mV / 10.0f) + TEMP_OFFSETC;
+  g_TempC_int = (int)roundf(g_TempC);
+}
+
+// ==== CT ====
+static float medirVrms_AC(uint32_t N, uint32_t sample_delay_us) {
+  uint64_t sum = 0;
+  for (uint32_t i = 0; i < N; i++) { sum += (uint32_t)analogRead(PIN_CT); delayMicroseconds(sample_delay_us); }
+  float mean_counts = (float)sum / (float)N;
+
+  uint64_t sumsq = 0;
+  int minv = 4095, maxv = 0;
+  for (uint32_t i = 0; i < N; i++) {
+    int r = analogRead(PIN_CT);
+    int centered = (int)((float)r - mean_counts);
+    sumsq += (int64_t)centered * (int64_t)centered;
+    if (r < minv) minv = r; if (r > maxv) maxv = r;
+    delayMicroseconds(sample_delay_us);
+  }
+
+  if (minv <= 8 || maxv >= 4087) {
+    Serial.println("⚠ CLIP detectado, bloque descartado");
+    return NAN;
+  }
+
+  return sqrtf((float)sumsq / (float)N) * SCALE;
+}
+
+void computeCT() {
+  const float  Ts_us_nom = 80.0f;
+  const float  Fs_est    = 1e6f / Ts_us_nom;
+  uint32_t samples_per_cycle = (uint32_t)(Fs_est * 0.020f + 0.5f);
+  if (samples_per_cycle < 200) samples_per_cycle = 200;
+
+  const uint32_t N_base = 5000;
+  uint32_t N = (N_base / samples_per_cycle) * samples_per_cycle;
+  if (N < samples_per_cycle * 10) N = samples_per_cycle * 10;
+  const uint32_t du = (uint32_t)Ts_us_nom;
+
+  float Vrms_AC = medirVrms_AC(N, du);
+  if (isnan(Vrms_AC)) return;
+
+  float Vrms_corr = (Vrms_AC > VRMS0_FIXED)
+                  ? sqrtf(Vrms_AC*Vrms_AC - VRMS0_FIXED*VRMS0_FIXED)
+                  : 0.0f;
+
+  if (Vrms_corr < DEADBAND_MIN_V) Vrms_corr = 0.0f;
+
+  if (last_block_Vrms_corr > 0.0f) {
+    float drop = (last_block_Vrms_corr - Vrms_corr) / (last_block_Vrms_corr + 1e-9f);
+    if (drop > DROP_RESET) ema_Vrms_corr = Vrms_corr;
+  }
+
+  ema_Vrms_corr = (1.0f - EMA_ALPHA_CT) * ema_Vrms_corr + EMA_ALPHA_CT * Vrms_corr;
+  last_block_Vrms_corr = Vrms_corr;
+
+  g_Irms_A = ema_Vrms_corr * AMPS_PER_V * K_GAIN;
+
+  funciona_flag  = (g_Irms_A > ZERO_EPS_A);
+  g_Irms_sent_A  = funciona_flag ? g_Irms_A : 0.0f;
+
+  static unsigned long dbg_t = 0;
+  if (millis() - dbg_t > 2000) {
+    dbg_t = millis();
+    Serial.print("Vrms_corr=");  Serial.print(ema_Vrms_corr, 5);
+    Serial.print(" V  | Irms="); Serial.print(g_Irms_A, 2);
+    Serial.print(" A  | Funciona="); Serial.println(funciona_flag ? "ON":"off");
+  }
+}
+
+// =====================================================
 
 void setup() {
   Serial.begin(115200);
+  delay(200);
 
+  // ===== [NUEVO] LED WiFi =====
+  pinMode(PIN_WIFI_LED, OUTPUT);
+  digitalWrite(PIN_WIFI_LED, LOW);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_LM35, ADC_0db);
+  analogSetPinAttenuation(PIN_CT,   ADC_11db);
+
+  // WiFi
   WiFi.begin(ssid, password);
-  Serial.print("Conectando a WiFi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  Serial.print("Conectando a WiFi");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(500); Serial.print(".");
   }
-  Serial.println("\n✅ WiFi conectado");
+  Serial.println();
 
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(PIN_WIFI_LED, HIGH);
+    Serial.println("✅ WiFi conectado");
+    // ===== [PEDIDO #2] Imprimir IP =====
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else {
+    digitalWrite(PIN_WIFI_LED, LOW);
+    Serial.println("⚠ WiFi no conectado aún (seguimos con reintentos en loop)");
+  }
+
+  // MQTT
   mqttClient.setServer(tb_server, tb_port);
 
-  // Conexión Modbus
+  // Modbus
   if (!mb.connect(moxaIP)) {
-    Serial.println("❌ Falló conexión Modbus");
-    while (true) delay(500);
+    Serial.println("❌ Falló conexión Modbus (se reintenta en loop)");
   }
+
+  memset(lastDiStates, 0, sizeof(lastDiStates));
+  lastHourlySend = millis();
+
+  // Inicial EMA LM35
+  ema_mV = (float)analogReadMilliVolts(PIN_LM35);
+  g_TempC_int = (int)roundf(TEMP_GAIN * (ema_mV / 10.0f) + TEMP_OFFSETC);
+
+  lastSent_Irms_A    = NAN;
+  lastSent_TempC_int = INT_MIN;
+
+  Serial.print("CT params -> VRMS0_FIXED="); Serial.print(VRMS0_FIXED, 3);
+  Serial.print(" V, ZERO_EPS_A="); Serial.print(ZERO_EPS_A, 2);
+  Serial.print(" A, K_GAIN="); Serial.println(K_GAIN, 2);
+
+  // EMAIL
+  MailClient.networkReconnect(true);
+  smtp.debug(1);
+  smtp.callback(smtpCallback);
+
+  mailConfig.server.host_name = SMTP_HOST;
+  mailConfig.server.port      = SMTP_PORT;
+  mailConfig.login.email      = AUTHOR_EMAIL;
+  mailConfig.login.password   = AUTHOR_PASSWORD;
+  mailConfig.login.user_domain = "";
+
+  // NTP (Mail client lo usa, pero igual configuramos el sistema para time(nullptr))
+  mailConfig.time.ntp_server       = F("pool.ntp.org,time.nist.gov");
+  mailConfig.time.gmt_offset       = -3;
+  mailConfig.time.day_light_offset = 0;
+
+  // ===== [NUEVO] NTP del sistema (para timestamps del buffer) =====
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  // ===== [NUEVO] LittleFS =====
+  if (!LittleFS.begin(true)) {
+    Serial.println("❌ LittleFS init falló (se seguirá con RAM buffer)");
+  } else {
+    Serial.println("✅ LittleFS listo");
+  }
+
+  // Inicializar estados previos para bordes
+  if (!mb.readDiscreteInputs(0, diStates, 12)) {
+    memset(diStates, 0, sizeof(diStates));
+  }
+  memcpy(lastDiStates, diStates, sizeof(diStates));
+  lastDoorState = diStates[DOOR_DI_INDEX];
+
+  lastNowIsZero = (g_Irms_A <= ZERO_EPS_A);
+
+  // Primer intento MQTT (no bloqueante)
+  ensureMQTT();
 }
 
 void loop() {
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
-  }
+  // ===== [NUEVO] Conexión no bloqueante + LED =====
+  ensureWiFi();
+  ensureMQTT();
   mqttClient.loop();
 
-  if (mb.readDiscreteInputs(0, diStates, 12)) {
-    Serial.println("✅ Lectura Modbus exitosa. Enviando a ThingsBoard...");
-
-    // Armar JSON para ThingsBoard
-    DynamicJsonDocument json(512);
-    for (int i = 0; i < 12; i++) {
-      String key = "DI" + String(i);
-      json[key] = diStates[i];
-    }
-
-    char payload[256];
-    serializeJson(json, payload);
-
-    // Publicar a ThingsBoard
-    mqttClient.publish("v1/devices/me/telemetry", payload);
-    Serial.println("📤 Payload enviado:");
-    Serial.println(payload);
-  } else {
-    Serial.println("❌ Falló lectura Modbus, intentando reconexión...");
-    mb.disconnect();
-    delay(1000);
-    mb.connect(moxaIP);
+  // 1) DI por Modbus
+  if (!mb.readDiscreteInputs(0, diStates, 12)) {
+    Serial.println("❌ Modbus read falló, reconectando...");
+    mb.disconnect(); delay(200); mb.connect(moxaIP);
   }
 
-  delay(5000);  // Esperar 5 segundos entre ciclos
+  // 2) Medidas
+  measureLM35();
+  computeCT();
+
+  // 3) Lógica de envío / encolado
+  unsigned long now = millis();
+  bool timeForHourly = (now - lastHourlySend >= hourlyInterval);
+  bool diChanged     = checkDIChangesOnly();
+
+  bool tempBigChange = false;
+  if (lastSent_TempC_int == INT_MIN || abs(g_TempC_int - lastSent_TempC_int) >= 5)
+    tempBigChange = true;
+
+  bool currentBigChange = false;
+  if (isnan(lastSent_Irms_A) || fabsf(g_Irms_A - lastSent_Irms_A) >= SEND_DELTA_IRMS_A)
+    currentBigChange = true;
+
+  bool nowIsZero  = (g_Irms_A <= ZERO_EPS_A);
+  bool currentZeroEdge = (lastNowIsZero != nowIsZero);
+
+  if (diChanged || tempBigChange || currentBigChange || currentZeroEdge || timeForHourly) {
+    if (timeForHourly) { lastHourlySend = now; Serial.println("⏰ Keepalive 1h"); }
+    if (diChanged)          Serial.println("🔄 Cambio de estado (DI)");
+    if (tempBigChange)      Serial.println("📈 ΔTemp ≥ 5 °C");
+    if (currentBigChange)   Serial.println("⚡ ΔI ≥ 5 A (corriente real)");
+    if (currentZeroEdge)    Serial.println(nowIsZero ? "🛑 I→0 A (Funciona=FALSE)"
+                                                     : "▶ I>0 A (Funciona=TRUE)");
+
+    TelemetryRec rec = makeRecFromCurrent();
+
+    bool sent = false;
+    if (mqttClient.connected()) {
+      sent = publishRecTB(rec);
+    }
+
+    if (!sent) {
+      Serial.println("📦 Sin conectividad / publish falló -> guardando (RAM/FS)");
+      enqueueOffline(rec);
+    } else {
+      // Actualizar “últimos enviados” solo si publish OK
+      lastSent_Irms_A    = g_Irms_A;
+      lastSent_TempC_int = g_TempC_int;
+      memcpy(lastDiStates, diStates, sizeof(diStates));
+    }
+  }
+
+  // ===== [NUEVO] Flush de backlog cuando vuelve MQTT =====
+  if (mqttClient.connected()) {
+    flushRAM(10);
+    flushFS(30);
+  }
+
+  // ===== EMAIL ALERTS =====
+
+  // 1) Corriente pasa a 0 o se restablece
+  if (currentZeroEdge) {
+    if (nowIsZero) {
+      String subj = "[ALERTA] " + String(SITE_NAME) + ": Corriente en 0 A";
+      String body = "Sitio: " + String(SITE_NAME) + "\n"
+                    "Se detectó Irms <= " + String(ZERO_EPS_A, 2) + " A (Funciona=FALSE).\n"
+                    "Lectura actual: " + String(g_Irms_A, 2) + " A\n";
+      sendAlertEmail(subj, body);
+    } else {
+      String subj = "[RECUPERACIÓN] " + String(SITE_NAME) + ": Corriente restablecida";
+      String body = "Sitio: " + String(SITE_NAME) + "\n"
+                    "Irms > " + String(ZERO_EPS_A, 2) + " A (Funciona=TRUE).\n"
+                    "Lectura actual: " + String(g_Irms_A, 2) + " A\n";
+      sendAlertEmail(subj, body);
+    }
+    lastNowIsZero = nowIsZero;
+  }
+
+  // 2) Temperatura alta / normaliza
+  if (!tempAlertActive && g_TempC_int > TEMP_ALERT_HIGH) {
+    tempAlertActive = true;
+    String subj = "[ALERTA] " + String(SITE_NAME) + ": Temperatura alta (" + String(g_TempC_int) + " °C)";
+    String body = "Sitio: " + String(SITE_NAME) + "\n"
+                  "La temperatura superó " + String(TEMP_ALERT_HIGH) + " °C.\n"
+                  "Temp actual: " + String(g_TempC_int) + " °C\n";
+    sendAlertEmail(subj, body);
+  } else if (tempAlertActive && g_TempC_int < TEMP_ALERT_RESET) {
+    tempAlertActive = false;
+    String subj = "[RECUPERACIÓN] " + String(SITE_NAME) + ": Temperatura normalizada (" + String(g_TempC_int) + " °C)";
+    String body = "Sitio: " + String(SITE_NAME) + "\n"
+                  "La temperatura descendió por debajo de " + String(TEMP_ALERT_RESET) + " °C.\n"
+                  "Temp actual: " + String(g_TempC_int) + " °C\n";
+    sendAlertEmail(subj, body);
+  }
+
+  // 3) Puerta
+  bool doorState = diStates[DOOR_DI_INDEX];
+  if (doorState != lastDoorState) {
+    if (doorState) {
+      String subj = "[ALERTA] " + String(SITE_NAME) + ": Puerta ABIERTA (DI" + String(DOOR_DI_INDEX) + ")";
+      String body = "Sitio: " + String(SITE_NAME) + "\n"
+                    "Se detectó apertura de puerta en DI" + String(DOOR_DI_INDEX) + ".\n";
+      sendAlertEmail(subj, body);
+    } else {
+      String subj = "[INFO] " + String(SITE_NAME) + ": Puerta CERRADA (DI" + String(DOOR_DI_INDEX) + ")";
+      String body = "Sitio: " + String(SITE_NAME) + "\n"
+                    "Se detectó cierre de puerta en DI" + String(DOOR_DI_INDEX) + ".\n";
+      sendAlertEmail(subj, body);
+    }
+    lastDoorState = doorState;
+  }
+
+  delay(50);
 }
+
