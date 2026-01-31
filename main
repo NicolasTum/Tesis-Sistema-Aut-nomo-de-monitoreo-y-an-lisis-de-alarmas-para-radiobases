@@ -23,7 +23,7 @@ const char* ssid     = "Proyecto";
 const char* password = "asdasd123";
 
 // ===== [NUEVO] LED indicador WiFi =====
-// Uso GPIO2 (en muchas ESP32 DevKit es el LED integrado). No choca con 34/35.
+// LED indicación si hay RED para que la ESP puede enviar lo que tiene el MOXA
 const int PIN_WIFI_LED = 2;
 
 // ===== ThingsBoard (MQTT) =====
@@ -151,7 +151,7 @@ bool sendAlertEmail(const String& subject, const String& body) {
 }
 
 // =====================================================
-// ===== [NUEVO] STORE-AND-FORWARD (RAM + LittleFS) =====
+// ========= STORE-AND-FORWARD (RAM + LittleFS) ========
 // =====================================================
 
 static const char* LOG_FILE = "/tb_offline.jsonl";
@@ -267,6 +267,9 @@ bool publishRecTB(const TelemetryRec& r) {
   JsonObject values = doc.createNestedObject("values");
   values["ts_valid"] = r.ts_valid;
   values["mono_ms"]  = (uint32_t)r.mono_ms;
+
+  //values["event_ts_ms"] = (uint64_t)r.ts_ms;
+
   
   for (int i = 0; i < 12; i++) {
     String key = "DI" + String(i);
@@ -483,7 +486,7 @@ void flushFS(uint16_t maxLinesPerLoop = 30) {
 }
 
 // =====================================================
-// ===== [NUEVO] Conexión NO BLOQUEANTE WiFi/MQTT =======
+// =====  Conexión NO BLOQUEANTE WiFi/MQTT =======
 // =====================================================
 
 bool ensureWiFi() {
@@ -692,7 +695,7 @@ void setup() {
   mailConfig.time.gmt_offset       = -3;
   mailConfig.time.day_light_offset = 0;
 
-  // ===== [NUEVO] NTP del sistema (para timestamps del buffer) =====
+  // =====  NTP del sistema (para timestamps del buffer) =====
   configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   Serial.println("🕒 Configurado NTP, esperando sincronización...");
   
@@ -705,7 +708,7 @@ void setup() {
     delay(250);
   }
 
-  // ===== [NUEVO] LittleFS =====
+  // =====  LittleFS =====
   if (!LittleFS.begin(true)) {
     Serial.println("❌ LittleFS init falló (se seguirá con RAM buffer)");
   } else {
@@ -726,10 +729,10 @@ void setup() {
 }
 
 void loop() {
-  // ===== [NUEVO] Verificar y sincronizar tiempo =====
+  // =====  Verificar y sincronizar tiempo =====
   checkAndSyncTime();
   
-  // ===== [NUEVO] Conexión no bloqueante + LED =====
+  // =====  Conexión no bloqueante + LED =====
   ensureWiFi();
   ensureMQTT();
   mqttClient.loop();
