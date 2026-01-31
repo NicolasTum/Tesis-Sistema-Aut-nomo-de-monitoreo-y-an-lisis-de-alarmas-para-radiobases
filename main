@@ -793,12 +793,13 @@ void loop() {
     if (!sent) {
       Serial.println("📦 Sin conectividad / publish falló -> guardando (RAM/FS)");
       enqueueOffline(rec);
-    } else {
+
+    }
       // Actualizar "últimos enviados" solo si publish OK
       lastSent_Irms_A    = g_Irms_A;
       lastSent_TempC_int = g_TempC_int;
       memcpy(lastDiStates, diStates, sizeof(diStates));
-    }
+    
   }
 
   // ===== [NUEVO] Flush de backlog cuando vuelve MQTT =====
