@@ -1,6 +1,6 @@
-// Codigo Pilar Marinez y Nicolás Tumaián
+// Codigo Pilar Martínez y Nicolás Tumaián
 // Pilar - 268474 , Nicolás 251664
-// Tesis para Ingeniería eléctrica en electrónica y en telecomunicaciones para la Universidad ORT
+// Tesis para Ingeniería en electrónica y en telecomunicaciones para la Universidad ORT
 //
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -9,22 +9,29 @@
 #include <math.h>
 #include <limits.h>
 #include <time.h>
-#include "TelemetryRec.h" 
+#include "TelemetryRec.h"
 #include <sys/time.h>
+#include <ESPping.h>
 
 // ===== EMAIL ALERTS (ESP Mail Client) =====
 #include <ESP_Mail_Client.h>
 
-// ===== [NUEVO] LittleFS para persistencia =====
+// ===== HTTP para leer routing desde Google Apps Script =====
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// ===== LittleFS para persistencia =====
 #include <LittleFS.h>
 
 // ===== WiFi =====
 const char* ssid     = "Proyecto";
 const char* password = "asdasd123";
 
-// ===== [NUEVO] LED indicador WiFi =====
-// LED indicación si hay RED para que la ESP puede enviar lo que tiene el MOXA
-const int PIN_WIFI_LED = 2;
+// ===== LED ROJO indicador WiFi =====
+const int PIN_NET_ALERT_LED = 16;
+
+// ===== LED AZUL indicador Red =====
+const int PIN_WIFI_LED = 4;
 
 // ===== ThingsBoard (MQTT) =====
 const char* tb_server = "demo.thingsboard.io";
@@ -41,7 +48,7 @@ ModBus mb;
 bool diStates[12];
 bool lastDiStates[12];
 
-// Índice del DI que corresponde a la puerta
+// ===== Índice del DI que corresponde a la puerta =====
 const int DOOR_DI_INDEX = 0;
 
 // ===== Pines =====
@@ -63,6 +70,7 @@ float g_TempC     = 0.0f;
 int   g_TempC_int = 0;
 int   lastSent_TempC_int = INT_MIN;
 
+// ===== Alertas de termometro por temperatura muy alta =====
 const int TEMP_ALERT_HIGH  = 35;
 const int TEMP_ALERT_RESET = 33;
 bool tempAlertActive = false;
@@ -104,7 +112,23 @@ const char* SITE_NAME = "Radiobase ORT";
 
 #define AUTHOR_EMAIL    "alertastesismartineztumaian@gmail.com"
 #define AUTHOR_PASSWORD "yuykewepcozzaqmy"
-#define RECIPIENT_EMAIL "tesismartineztumaian@gmail.com"
+#define RECIPIENT_EMAIL "tesismartineztumaian@gmail.com"  // fallback (Centro de Control)
+
+// ===== Routing por device_id vía Google Apps Script =====
+static const char* ROUTING_ENDPOINT =
+  "https://script.google.com/macros/s/AKfycbwreMLL4dMnNDQ5paslx4tGlbHH0JOOmE42Iya5A3TsrW4RfDSkIbQQNrz1oOFz08rkkA/exec";
+
+// IMPORTANTE: este ID NO debería cambiar aunque el equipo se mueva.
+// Si se mueve de zona, se cambia SOLO en la Google Sheet (fila).
+static const char* DEVICE_ID = "Radiobase ORT";
+
+// Cache de destinatarios (para no pegarle al endpoint en cada mail)
+static const uint32_t ROUTING_REFRESH_MS = 10UL * 60UL * 1000UL; // 10 min
+static uint32_t lastRoutingFetchMs = 0;
+
+#define MAX_RECIPIENTS 6
+String gRecipients[MAX_RECIPIENTS];
+int    gRecipientCount = 0;
 
 SMTPSession smtp;
 Session_Config mailConfig;
@@ -120,7 +144,174 @@ void smtpCallback(SMTP_Status status) {
   }
 }
 
+// Verificación de Salida a Internet.
+bool hasInternet_() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClient client;
+  client.setTimeout(1500);
+
+  bool ok = client.connect(IPAddress(8, 8, 8, 8), 53);
+
+  client.stop();
+  return ok;
+}
+
+
+
+// ===== [MAIL] URL encode simple =====
+static bool isUnreserved(char c) {
+  if (c >= 'A' && c <= 'Z') return true;
+  if (c >= 'a' && c <= 'z') return true;
+  if (c >= '0' && c <= '9') return true;
+  switch (c) {
+    case '-': case '_': case '.': case '~': return true;
+    default: return false;
+  }
+}
+static String urlEncode(const String& s) {
+  const char* hex = "0123456789ABCDEF";
+  String out;
+  out.reserve(s.length() * 3);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isUnreserved(c)) {
+      out += c;
+    } else {
+      out += '%';
+      out += hex[(c >> 4) & 0x0F];
+      out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
+// ===== [MAIL] Setear lista de destinatarios =====
+static void setRecipientsFromArray(JsonArray arr) {
+  gRecipientCount = 0;
+
+  for (JsonVariant v : arr) {
+    if (!v.is<const char*>()) continue;
+    String email = String((const char*)v);
+    email.trim();
+    if (email.length() == 0) continue;
+
+    bool exists = false;
+    for (int i = 0; i < gRecipientCount; i++) {
+      if (gRecipients[i].equalsIgnoreCase(email)) { exists = true; break; }
+    }
+    if (exists) continue;
+
+    if (gRecipientCount < MAX_RECIPIENTS) {
+      gRecipients[gRecipientCount++] = email;
+    }
+  }
+
+  Serial.print("📧 Routing recipients cargados: ");
+  Serial.println(gRecipientCount);
+  for (int i = 0; i < gRecipientCount; i++) {
+    Serial.print("   - ");
+    Serial.println(gRecipients[i]);
+  }
+}
+
+// ===== [MAIL] Fetch del routing desde Apps Script =====
+static bool fetchRoutingRecipients(bool force = false) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠ Routing: sin WiFi (no se puede fetchear). Se usará fallback si hace falta.");
+    return false;
+  }
+
+  uint32_t now = millis();
+  if (!force && (now - lastRoutingFetchMs) < ROUTING_REFRESH_MS && lastRoutingFetchMs != 0) {
+    Serial.println("ℹ️ Routing: usando cache (no se refetchea).");
+    return (gRecipientCount > 0);
+  }
+  lastRoutingFetchMs = now;
+
+  String url = String(ROUTING_ENDPOINT) + "?device_id=" + urlEncode(String(DEVICE_ID));
+  Serial.print("🌐 Routing GET: ");
+  Serial.println(url);
+
+  WiFiClientSecure client;
+  client.setInsecure(); // para evitar problemas de certificados en ESP32
+
+  HTTPClient http;
+  http.setTimeout(4000);
+
+  // ===== [MOD - MAIL] IMPORTANTE: seguir redirects =====
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, url)) {
+    Serial.println("❌ Routing: http.begin falló");
+    http.end();
+    return false;
+  }
+
+  int code = http.GET();
+  if (code <= 0) {
+    Serial.print("❌ Routing: HTTP GET error: ");
+    Serial.println(code);
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  Serial.print("🌐 Routing HTTP code: ");
+  Serial.println(code);
+
+  // ===== [MOD - MAIL] Solo procesar JSON si es 200 =====
+  if (code != 200) {
+    Serial.print("❌ Routing: HTTP != 200. Payload head: ");
+    Serial.println(payload.substring(0, 200));
+    return false;
+  }
+
+  // ===== [MOD - MAIL] Debug compacto (no imprimir todo el HTML/JSON) =====
+  Serial.print("🌐 Routing payload head: ");
+  Serial.println(payload.substring(0, 200));
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("❌ JSON parse routing error: ");
+    Serial.println(err.c_str());
+    Serial.print("   Payload head (debug): ");
+    Serial.println(payload.substring(0, 200));
+    return false;
+  }
+
+  bool ok = doc["ok"] | false;
+  if (!ok) {
+    Serial.print("❌ routing ok=false. error=");
+    Serial.println((const char*)(doc["error"] | "unknown"));
+    return false;
+  }
+
+  if (!doc["emails"].is<JsonArray>()) {
+    Serial.println("❌ routing: 'emails' no es array");
+    return false;
+  }
+
+  setRecipientsFromArray(doc["emails"].as<JsonArray>());
+  return (gRecipientCount > 0);
+}
+
+// ===== [MOD - MAIL] Envío a múltiple destinatario (o fallback) =====
 bool sendAlertEmail(const String& subject, const String& body) {
+  // Refrescar destinatarios si corresponde (timeout 4s)
+  // Si falla, se usa fallback.
+  fetchRoutingRecipients(false);
+
+  // Debug: mostrar si está enviando por routing o fallback
+  if (gRecipientCount > 0) {
+    Serial.println("📧 Envío MAIL usando ROUTING (Google Sheet).");
+  } else {
+    Serial.println("📧 Envío MAIL usando FALLBACK (hardcoded Centro de Control).");
+  }
+
   if (!smtp.connected()) {
     if (!smtp.connect(&mailConfig)) {
       Serial.printf("SMTP connect error. Status=%d, Code=%d, Reason=%s\n",
@@ -133,7 +324,15 @@ bool sendAlertEmail(const String& subject, const String& body) {
   msg.sender.name  = F("ESP32 Alarmas");
   msg.sender.email = AUTHOR_EMAIL;
   msg.subject      = subject.c_str();
-  msg.addRecipient(F("Tesis"), RECIPIENT_EMAIL);
+
+  // Si hay routing, enviar a todos. Si no, fallback.
+  if (gRecipientCount > 0) {
+    for (int i = 0; i < gRecipientCount; i++) {
+      msg.addRecipient(F("Tesis"), gRecipients[i].c_str());
+    }
+  } else {
+    msg.addRecipient(F("Tesis"), RECIPIENT_EMAIL);
+  }
 
   msg.text.content = body.c_str();
   msg.text.charSet = "utf-8";
@@ -151,7 +350,7 @@ bool sendAlertEmail(const String& subject, const String& body) {
 }
 
 // =====================================================
-// ========= STORE-AND-FORWARD (RAM + LittleFS) ========
+// ===== STORE-AND-FORWARD (RAM + LittleFS) =====
 // =====================================================
 
 static const char* LOG_FILE = "/tb_offline.jsonl";
@@ -225,7 +424,7 @@ TelemetryRec makeRecFromCurrent(uint64_t custom_ts_ms = 0) {
     r.ts_valid = timeIsValid();
     r.ts_ms = r.ts_valid ? getEpochMsNow() : 0ULL;
   }
-  
+
   r.mono_ms = millis();
   r.diMask = makeDiMask();
   r.tempC = (int16_t)g_TempC_int;
@@ -238,7 +437,7 @@ TelemetryRec makeRecFromCurrent(uint64_t custom_ts_ms = 0) {
 void enqueueEventWithCurrentTimestamp() {
   uint64_t eventTs = getEpochMsNow();
   TelemetryRec rec = makeRecFromCurrent(eventTs);
-  
+
   if (mqttClient.connected()) {
     if (publishRecTB(rec)) {
       // Éxito - actualizar estados enviados
@@ -248,7 +447,7 @@ void enqueueEventWithCurrentTimestamp() {
       return;
     }
   }
-  
+
   // Falló, guardar en buffer
   Serial.println("📦 Sin conectividad / publish falló -> guardando (RAM/FS)");
   enqueueOffline(rec);
@@ -258,7 +457,7 @@ void enqueueEventWithCurrentTimestamp() {
 // {"ts":..., "values":{...}}
 bool publishRecTB(const TelemetryRec& r) {
   DynamicJsonDocument doc(768);
-  
+
   // Usar el timestamp del evento (no el actual)
   if (r.ts_valid) {
     doc["ts"] = (uint64_t)r.ts_ms;  // ✅ hora real del evento (ms)
@@ -268,9 +467,6 @@ bool publishRecTB(const TelemetryRec& r) {
   values["ts_valid"] = r.ts_valid;
   values["mono_ms"]  = (uint32_t)r.mono_ms;
 
-  //values["event_ts_ms"] = (uint64_t)r.ts_ms;
-
-  
   for (int i = 0; i < 12; i++) {
     String key = "DI" + String(i);
     values[key] = ((r.diMask >> i) & 1);
@@ -340,7 +536,7 @@ bool appendRecToFS(const TelemetryRec& r) {
   }
   f.print("\n");
   f.close();
-  
+
   Serial.print("💾 Guardado en FS: ts=");
   Serial.println(r.ts_ms);
   return true;
@@ -390,7 +586,7 @@ void flushRAM(uint16_t maxPerLoop = 10) {
   while (sent < maxPerLoop && ramPop(r)) {
     Serial.print("🔄 Enviando desde RAM: ts=");
     Serial.println(r.ts_ms);
-    
+
     if (!publishRecTB(r)) {
       // si falla, re-encolamos
       Serial.println("❌ Falló envio desde RAM, re-encolando...");
@@ -401,7 +597,7 @@ void flushRAM(uint16_t maxPerLoop = 10) {
     mqttClient.loop();
     delay(5);
   }
-  
+
   if (sent > 0) {
     Serial.printf("✅ flushRAM: enviados %u registros\n", sent);
   }
@@ -412,12 +608,12 @@ void flushFS(uint16_t maxLinesPerLoop = 30) {
     Serial.println("⚠ flushFS: MQTT no conectado");
     return;
   }
-  
+
   if (!LittleFS.begin(true)) {
     Serial.println("❌ flushFS: LittleFS no disponible");
     return;
   }
-  
+
   if (!LittleFS.exists(LOG_FILE)) {
     Serial.println("ℹ️ flushFS: No hay archivo de log");
     return;
@@ -430,10 +626,10 @@ void flushFS(uint16_t maxLinesPerLoop = 30) {
   }
 
   File out = LittleFS.open(TMP_FILE, "w");
-  if (!out) { 
-    in.close(); 
+  if (!out) {
+    in.close();
     Serial.println("❌ flushFS: No pude abrir TMP_FILE para escritura");
-    return; 
+    return;
   }
 
   uint16_t processed = 0;
@@ -456,7 +652,7 @@ void flushFS(uint16_t maxLinesPerLoop = 30) {
 
     Serial.print("🔄 Enviando desde FS: ts=");
     Serial.println(r.ts_ms);
-    
+
     if (!publishRecTB(r)) {
       // si falla, preservamos esta línea y el resto
       Serial.println("❌ Falló envio desde FS, preservando resto...");
@@ -486,7 +682,7 @@ void flushFS(uint16_t maxLinesPerLoop = 30) {
 }
 
 // =====================================================
-// =====  Conexión NO BLOQUEANTE WiFi/MQTT =======
+// ===== Conexión NO BLOQUEANTE WiFi/MQTT =======
 // =====================================================
 
 bool ensureWiFi() {
@@ -500,7 +696,7 @@ bool ensureWiFi() {
   digitalWrite(PIN_WIFI_LED, LOW);
 
   if (mqttClient.connected()) mqttClient.disconnect();
-  
+
   if (millis() - lastTry < 5000) return false;
   lastTry = millis();
 
@@ -522,16 +718,16 @@ bool ensureMQTT() {
   Serial.print("🔄 MQTT reconnect...");
   bool ok = mqttClient.connect("ESP32Cliente", tb_token, NULL);
   Serial.println(ok ? "✅" : "❌");
-  
+
   // Si reconectamos, intentar flushear backlog inmediatamente
   if (ok) {
     Serial.println("🔄 Reconexión MQTT exitosa, iniciando flush de backlog...");
   }
-  
+
   return ok;
 }
 
-// ===== Helpers DI =====
+// ===== MOXA DI =====
 bool checkDIChangesOnly() {
   for (int i = 0; i < 12; i++) if (diStates[i] != lastDiStates[i]) return true;
   return false;
@@ -557,9 +753,9 @@ void measureLM35() {
 // ==== CT ====
 static float medirVrms_AC(uint32_t N, uint32_t sample_delay_us) {
   uint64_t sum = 0;
-  for (uint32_t i = 0; i < N; i++) { 
-    sum += (uint32_t)analogRead(PIN_CT); 
-    delayMicroseconds(sample_delay_us); 
+  for (uint32_t i = 0; i < N; i++) {
+    sum += (uint32_t)analogRead(PIN_CT);
+    delayMicroseconds(sample_delay_us);
   }
   float mean_counts = (float)sum / (float)N;
 
@@ -569,7 +765,7 @@ static float medirVrms_AC(uint32_t N, uint32_t sample_delay_us) {
     int r = analogRead(PIN_CT);
     int centered = (int)((float)r - mean_counts);
     sumsq += (int64_t)centered * (int64_t)centered;
-    if (r < minv) minv = r; 
+    if (r < minv) minv = r;
     if (r > maxv) maxv = r;
     delayMicroseconds(sample_delay_us);
   }
@@ -624,13 +820,16 @@ void computeCT() {
   }
 }
 
-// =====================================================
 
 void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // ===== [NUEVO] LED WiFi =====
+// Al conectarnos asumismos que no hay internet, entonces prendemos LED ROJO
+  pinMode(PIN_NET_ALERT_LED, OUTPUT);
+  digitalWrite(PIN_NET_ALERT_LED, HIGH);
+
+  // ===== LED WiFi =====
   pinMode(PIN_WIFI_LED, OUTPUT);
   digitalWrite(PIN_WIFI_LED, LOW);
 
@@ -690,15 +889,15 @@ void setup() {
   mailConfig.login.password   = AUTHOR_PASSWORD;
   mailConfig.login.user_domain = "";
 
-  // NTP (Mail client lo usa, pero igual configuramos el sistema para time(nullptr))
+
   mailConfig.time.ntp_server       = F("pool.ntp.org,time.nist.gov");
   mailConfig.time.gmt_offset       = -3;
   mailConfig.time.day_light_offset = 0;
 
-  // =====  NTP del sistema (para timestamps del buffer) =====
+  // ===== NTP del sistema (para timestamps del buffer) =====
   configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   Serial.println("🕒 Configurado NTP, esperando sincronización...");
-  
+
   // Esperar un poco por sincronización inicial
   for (int i = 0; i < 20; i++) {
     if (timeIsValid()) {
@@ -708,7 +907,7 @@ void setup() {
     delay(250);
   }
 
-  // =====  LittleFS =====
+  // ===== LittleFS =====
   if (!LittleFS.begin(true)) {
     Serial.println("❌ LittleFS init falló (se seguirá con RAM buffer)");
   } else {
@@ -724,15 +923,39 @@ void setup() {
 
   lastNowIsZero = (g_Irms_A <= ZERO_EPS_A);
 
+  // ===== [MAIL] Primer fetch (si hay WiFi) =====
+  if (WiFi.status() == WL_CONNECTED) {
+    fetchRoutingRecipients(true);
+  }
+
   // Primer intento MQTT (no bloqueante)
   ensureMQTT();
 }
 
 void loop() {
-  // =====  Verificar y sincronizar tiempo =====
-  checkAndSyncTime();
   
-  // =====  Conexión no bloqueante + LED =====
+  
+  static uint32_t lastInetCheckMs = 0;
+static bool internetOK = false;
+
+if (millis() - lastInetCheckMs > 15000) { // cada 15 segundos
+  lastInetCheckMs = millis();
+  internetOK = hasInternet_();
+
+  // LED: ON = falla, OFF = OK
+ digitalWrite(PIN_NET_ALERT_LED, internetOK ?  LOW : HIGH);
+
+}
+
+
+  
+  
+  
+  
+  // ===== Verificar y sincronizar tiempo =====
+  checkAndSyncTime();
+
+  // ===== Conexión no bloqueante + LED =====
   ensureWiFi();
   ensureMQTT();
   mqttClient.loop();
@@ -765,15 +988,15 @@ void loop() {
 
   // Detectar eventos importantes
   bool eventOccurred = diChanged || tempBigChange || currentBigChange || currentZeroEdge || timeForHourly;
-  
+
   if (eventOccurred) {
     // CAPTURAR TIMESTAMP INMEDIATAMENTE cuando ocurre un evento
     uint64_t eventTimestamp = getEpochMsNow();
-    
+
     // Log del tipo de evento
-    if (timeForHourly) { 
-      lastHourlySend = now; 
-      Serial.println("⏰ Keepalive 1h"); 
+    if (timeForHourly) {
+      lastHourlySend = now;
+      Serial.println("⏰ Keepalive 1h");
     }
     if (diChanged)          Serial.println("🔄 Cambio de estado (DI)");
     if (tempBigChange)      Serial.println("📈 ΔTemp ≥ 5 °C");
@@ -783,43 +1006,25 @@ void loop() {
 
     // Crear registro con timestamp del evento
     TelemetryRec rec = makeRecFromCurrent(eventTimestamp);
-    
+
     // Intentar enviar
     bool sent = false;
     if (mqttClient.connected()) {
       sent = publishRecTB(rec);
     }
-/* TO DO (REVISAR - Esto envia una sola vez pero a su vez se actualiza todo el tiempo)
+
     if (!sent) {
       Serial.println("📦 Sin conectividad / publish falló -> guardando (RAM/FS)");
       enqueueOffline(rec);
-
-    }
+    } else {
       // Actualizar "últimos enviados" solo si publish OK
       lastSent_Irms_A    = g_Irms_A;
       lastSent_TempC_int = g_TempC_int;
-      memcpy(lastDiStates, diStates, sizeof(diStates));}
-   */ 
-  
+      memcpy(lastDiStates, diStates, sizeof(diStates));
+    }
+  }
 
-
-if (!sent) {
-  Serial.println("📦 Sin conectividad / publish falló -> guardando (RAM/FS)");
-  enqueueOffline(rec);
-
-  // ✅ IMPORTANTE: ya quedó registrado en RAM/FS, así que lo marcamos como "reportado"
-  lastSent_Irms_A    = g_Irms_A;
-  lastSent_TempC_int = g_TempC_int;
-  memcpy(lastDiStates, diStates, sizeof(diStates));
-
-} else {
-  // Actualizar "últimos enviados" solo si publish OK
-  lastSent_Irms_A    = g_Irms_A;
-  lastSent_TempC_int = g_TempC_int;
-  memcpy(lastDiStates, diStates, sizeof(diStates));
-}
-}
-  // ===== [NUEVO] Flush de backlog cuando vuelve MQTT =====
+  // ===== Flush de backlog cuando vuelve MQTT =====
   if (mqttClient.connected()) {
     flushRAM(10);
     flushFS(30);
@@ -832,13 +1037,13 @@ if (!sent) {
     // Capturar timestamp del evento de alarma
     uint64_t alarmTimestamp = getEpochMsNow();
     TelemetryRec alarmRec = makeRecFromCurrent(alarmTimestamp);
-    
+
     // Intentar enviar inmediatamente
     bool sent = mqttClient.connected() ? publishRecTB(alarmRec) : false;
     if (!sent) {
       enqueueOffline(alarmRec);
     }
-    
+
     // Enviar email
     if (nowIsZero) {
       String subj = "[ALERTA] " + String(SITE_NAME) + ": Corriente en 0 A";
@@ -861,16 +1066,16 @@ if (!sent) {
   // 2) Temperatura alta / normaliza
   if (!tempAlertActive && g_TempC_int > TEMP_ALERT_HIGH) {
     tempAlertActive = true;
-    
+
     // Capturar timestamp y guardar evento
     uint64_t alarmTimestamp = getEpochMsNow();
     TelemetryRec alarmRec = makeRecFromCurrent(alarmTimestamp);
-    
+
     bool sent = mqttClient.connected() ? publishRecTB(alarmRec) : false;
     if (!sent) {
       enqueueOffline(alarmRec);
     }
-    
+
     String subj = "[ALERTA] " + String(SITE_NAME) + ": Temperatura alta (" + String(g_TempC_int) + " °C)";
     String body = "Sitio: " + String(SITE_NAME) + "\n"
                   "La temperatura superó " + String(TEMP_ALERT_HIGH) + " °C.\n"
@@ -879,16 +1084,16 @@ if (!sent) {
     sendAlertEmail(subj, body);
   } else if (tempAlertActive && g_TempC_int < TEMP_ALERT_RESET) {
     tempAlertActive = false;
-    
+
     // Capturar timestamp y guardar evento
     uint64_t alarmTimestamp = getEpochMsNow();
     TelemetryRec alarmRec = makeRecFromCurrent(alarmTimestamp);
-    
+
     bool sent = mqttClient.connected() ? publishRecTB(alarmRec) : false;
     if (!sent) {
       enqueueOffline(alarmRec);
     }
-    
+
     String subj = "[RECUPERACIÓN] " + String(SITE_NAME) + ": Temperatura normalizada (" + String(g_TempC_int) + " °C)";
     String body = "Sitio: " + String(SITE_NAME) + "\n"
                   "La temperatura descendió por debajo de " + String(TEMP_ALERT_RESET) + " °C.\n"
@@ -903,12 +1108,12 @@ if (!sent) {
     // Capturar timestamp y guardar evento
     uint64_t alarmTimestamp = getEpochMsNow();
     TelemetryRec alarmRec = makeRecFromCurrent(alarmTimestamp);
-    
+
     bool sent = mqttClient.connected() ? publishRecTB(alarmRec) : false;
     if (!sent) {
       enqueueOffline(alarmRec);
     }
-    
+
     if (doorState) {
       String subj = "[ALERTA] " + String(SITE_NAME) + ": Puerta ABIERTA (DI" + String(DOOR_DI_INDEX) + ")";
       String body = "Sitio: " + String(SITE_NAME) + "\n"
@@ -926,4 +1131,5 @@ if (!sent) {
   }
 
   delay(50);
+  
 }

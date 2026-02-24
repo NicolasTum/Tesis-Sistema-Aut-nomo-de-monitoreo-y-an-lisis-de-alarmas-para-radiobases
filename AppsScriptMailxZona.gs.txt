@@ -1,0 +1,63 @@
+function doGet(e) {
+  try {
+    const deviceId = (e.parameter.device_id || "").trim();
+    if (!deviceId) {
+      return jsonResponse({ ok: false, error: "Missing parameter: device_id" }, 400);
+    }
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheets()[0]; // primera hoja (si querés, luego lo fijamos por nombre)
+    const data = sheet.getDataRange().getValues();
+
+    if (data.length < 2) {
+      return jsonResponse({ ok: false, error: "Sheet has no data rows" }, 500);
+    }
+
+    // Headers
+    const headers = data[0].map(h => String(h).toLowerCase().trim());
+    const deviceCol = headers.indexOf("device_id");
+    const zoneCol   = headers.indexOf("zone");   // opcional
+    const emailsCol = headers.indexOf("emails");
+
+    if (deviceCol === -1 || emailsCol === -1) {
+      return jsonResponse({
+        ok: false,
+        error: "Headers must include: device_id, emails (zone optional)"
+      }, 500);
+    }
+
+    // Buscar match exacto por device_id (case-sensitive por ahora)
+    for (let i = 1; i < data.length; i++) {
+      const rowDeviceId = String(data[i][deviceCol]).trim();
+      if (rowDeviceId === deviceId) {
+        const rawEmails = String(data[i][emailsCol] || "").trim();
+        const emails = rawEmails
+          .split(";")
+          .map(s => s.trim())
+          .filter(s => s.length > 0);
+
+        const zone = (zoneCol !== -1) ? String(data[i][zoneCol] || "").trim() : "";
+
+        return jsonResponse({
+          ok: true,
+          device_id: deviceId,
+          zone: zone,
+          emails: emails
+        }, 200);
+      }
+    }
+
+    return jsonResponse({ ok: false, error: "Device not found", device_id: deviceId }, 404);
+
+  } catch (err) {
+    return jsonResponse({ ok: false, error: String(err) }, 500);
+  }
+}
+
+function jsonResponse(obj, statusCode) {
+  // Apps Script no permite setear status code en ContentService,
+  // pero igual devolvemos JSON consistente.
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}

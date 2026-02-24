@@ -1,0 +1,111 @@
+patron,grupo
+baja temp,Baja temperatura
+alta temp,Alta temperatura
+temperatura,Alta temperatura
+sobretemp,Alta temperatura
+temp,Alta temperatura
+ng sobrtem fza aco2,Alta temperatura
+incendio,Falla sistema incendio
+incend,Falla sistema incendio
+intruso,Alerta presencia
+presencia,Alerta presencia
+cerca perimetral,Alerta presencia
+deteccion de presencia,Alerta presencia
+detección de presencia,Alerta presencia
+puerta abierta,Alerta presencia
+falla de arranque de grupo,Falla de grupo motor
+falla de grupo,Falla de grupo motor
+falla de red gmg,Falla de grupo motor
+f.red gmg,Falla de grupo motor
+bajo nivel de combustible,Falla de grupo motor
+bajo nivel combus gmg,Falla de grupo motor
+bajo comb,Falla de grupo motor
+ax bajo nivel de combus,Falla de grupo motor
+falla de predis,Falla de predisposición de grupo motor
+falla predis,Falla de predisposición de grupo motor
+f.pred,Falla de predisposición de grupo motor
+falla de predisposi,Falla de predisposición de grupo motor
+falla predisp gmg,Falla de predisposición de grupo motor
+falla de predisposicion gmg,Falla de predisposición de grupo motor
+falla pr gmg,Falla de predisposición de grupo motor
+grupo en marcha,Grupo en marcha
+gmg en servicio,Grupo en marcha
+ax gmg1 en servicio,Grupo en marcha
+ax gmg2 en servicio,Grupo en marcha
+ng gmg serv,Grupo en marcha
+gmg a en servicio,Grupo en marcha
+ax gmg 1000kva en servicio,Grupo en marcha
+ax gmg kva en servicio,Grupo en marcha
+baja tension de bateria,Baja tensión de baterías
+baja tension bateria,Baja tensión de baterías
+pw_tension de baterias <,Baja tensión de baterías
+tension de baterias <,Baja tensión de baterías
+pw_baja tension de baterias,Baja tensión de baterías
+bateria en descarga,Batería en descarga
+descarga de bateria,Batería en descarga
+ax bateria descarga,Batería en descarga
+desc bat,Batería en descarga
+ng bat desc,Batería en descarga
+ax descarga bat,Batería en descarga
+ax bat.en descarga,Batería en descarga
+ax bat.descarga,Batería en descarga
+pw bajo tiempo de respaldo de baterias,Bajo tiempo respaldo de baterías
+falla de alimentacion de acondicionadores,Falla alimentación acondicionador
+alimentacion de acondicionadores,Falla alimentación acondicionador
+falla de aliment. ac,Falla alimentación acondicionador
+falla alim ac,Falla alimentación acondicionador
+falla alim.ac,Falla alimentación acondicionador
+ng_falla alim ac,Falla alimentación acondicionador
+falla de alimentacion ac,Falla alimentación acondicionador
+alimentacion ac,Falla alimentación acondicionador
+falla de alimentacion de rectificadores,Falla alimentación rectificador
+alimentacion de rectificadores,Falla alimentación rectificador
+falla de rectificador (prevista fuego en sala),Falla rectificador
+fuego,Fuego
+falla de acondicionador en sala de ups (subsuelo),Falla acondicionador
+falla de acondicionador ups   ndc,Falla acondicionador
+falla ups,Falla UPS
+ups alarma comun,Falla UPS
+ups,Falla UPS
+falla acondicionador,Falla acondicionador
+aire,Falla acondicionador
+falla aire,Falla acondicionador
+A/A,Falla acondicionador
+acondicionador,Falla acondicionador
+compresor,Falla acondicionador
+falla comp,Falla acondicionador
+ax falla eq. comp. cia,Falla acondicionador
+ax presion mal presurizado,Falla acondicionador
+manejadora,Falla acondicionador
+chiller,Falla acondicionador
+ng falla eq. ac07,Falla acondicionador
+apertura de gabinete,Apertura de gabinete/puerta
+apertura de puerta,Apertura de gabinete/puerta
+baja tension de red,Baja tensión de red
+baja tension ac,Baja tensión de red
+baja tension de ac,Baja tensión de red
+pw_baja tension ac,Baja tensión de red
+baja tension de ac en fuente,Baja tensión de red
+baja tension de red acondicionamiento,Baja tensión de red
+ng_baja tension de red,Baja tensión de red
+alta tension de red,Alta tensión de red
+alta tension de red acondicionamiento,Alta tensión de red
+pw_alta tension ac,Alta tensión de red
+alta tension ac,Alta tensión de red
+alta tension de ac en fuente,Alta tensión de red
+fluctuacion anormal de tension,Tensión anormal
+fluctuación anormal de tension,Tensión anormal
+tension anormal,Tensión anormal
+tension anormal en la red,Tensión anormal
+tension anormal en la red acond.,Tensión anormal
+tension de consumo anormal,Tensión anormal
+tension de consumo anormal pw2,Tensión anormal
+rectificador,Falla rectificador
+rectif,Falla rectificador
+ax falla eq. sala.rect,Falla rectificador
+Falla de red,Falla de red
+balizaje,Falla balizaje
+dispositivo no responde,Dispositivo sin conectividad
+fusible,Falla tablero
+tablero,Falla tablero
+aco,Falla acondicionador

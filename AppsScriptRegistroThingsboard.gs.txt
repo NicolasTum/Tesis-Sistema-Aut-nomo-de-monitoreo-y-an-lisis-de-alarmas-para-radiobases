@@ -1,0 +1,452 @@
+/***** CONFIG *****/
+const SPREADSHEET_ID = "";
+
+/***** HOJAS *****/
+const FULL_SHEET_NAME = 'Registro_TB_All';
+const DEBUG_SHEET_NAME = 'Debug_Raw_Data';
+
+/***** UTILS *****/
+function getSpreadsheet_() {
+  if (SPREADSHEET_ID && SPREADSHEET_ID.trim() !== "") {
+    return SpreadsheetApp.openById(SPREADSHEET_ID);
+  }
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+/**
+ * Convierte un valor posible de timestamp (string/number/Date) a epoch ms.
+ * Acepta:
+ *  - 13 dígitos => ms
+ *  - 10 dígitos => segundos (se convierte a ms)
+ *  - string numérica
+ */
+function toEpochMs_(v) {
+  if (v === null || typeof v === 'undefined') return null;
+
+  // Date
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    const t = v.getTime();
+    return isNaN(t) ? null : t;
+  }
+
+  // string -> number
+  let n = v;
+  if (typeof n === 'string') {
+    n = n.trim();
+    if (!n) return null;
+    if (!/^-?\d+(\.\d+)?$/.test(n)) return null;
+    n = Number(n);
+  }
+
+  if (typeof n !== 'number' || !isFinite(n)) return null;
+
+  // seconds -> ms
+  if (n > 0 && n < 1e12) n = Math.round(n * 1000);
+
+  // rango razonable (>= 2020-01-01)
+  if (n < 1577836800000) return null;
+
+  return Math.round(n);
+}
+
+/**
+ * Busca el timestamp del evento en varias ubicaciones posibles.
+ * Devuelve epoch ms o null.
+ */
+function extractEventTsMs_(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+
+  function tryFrom(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+
+    return (
+      toEpochMs_(obj.event_ts_ms) ||
+      toEpochMs_(obj.eventTsMs) ||
+      toEpochMs_(obj.incident_ts_ms) ||
+      toEpochMs_(obj.incidentTsMs) ||
+      toEpochMs_(obj.ts_ms) ||
+      toEpochMs_(obj.tsMs) ||
+      toEpochMs_(obj.ts) ||
+      null
+    );
+  }
+
+  // 1) Top-level
+  let ts = tryFrom(payload);
+  if (ts) return ts;
+
+  // 2) TB estándar: {ts, values:{...}} o {values:{...}}
+  if (payload.values && typeof payload.values === 'object') {
+    ts = tryFrom(payload.values);
+    if (ts) return ts;
+  }
+
+  // 3) msg / msg.values (algunas rule chains)
+  if (payload.msg && typeof payload.msg === 'object') {
+    ts = tryFrom(payload.msg);
+    if (ts) return ts;
+
+    if (payload.msg.values && typeof payload.msg.values === 'object') {
+      ts = tryFrom(payload.msg.values);
+      if (ts) return ts;
+    }
+  }
+
+  // 4) telemetry array
+  if (Array.isArray(payload.telemetry) && payload.telemetry.length > 0) {
+    const last = payload.telemetry[payload.telemetry.length - 1] || {};
+    ts = tryFrom(last);
+    if (ts) return ts;
+
+    if (last.values && typeof last.values === 'object') {
+      ts = tryFrom(last.values);
+      if (ts) return ts;
+    }
+  }
+
+  return null;
+}
+
+/***** FUNCIÓN DEPURACIÓN *****/
+function logRawRequest(e) {
+  const ss = getSpreadsheet_();
+  let debugSheet = ss.getSheetByName(DEBUG_SHEET_NAME);
+
+  if (!debugSheet) {
+    debugSheet = ss.insertSheet(DEBUG_SHEET_NAME);
+    debugSheet.appendRow(['Timestamp', 'Raw Data', 'Parsed JSON', 'Error']);
+  }
+
+  const timestamp = Utilities.formatDate(new Date(), "GMT-3", "yyyy-MM-dd HH:mm:ss");
+  const rawData = (e && e.postData && e.postData.contents) ? e.postData.contents : 'NO_DATA';
+
+  let parsedJson = 'ERROR';
+  let errorMsg = '';
+
+  try {
+    parsedJson = JSON.stringify(JSON.parse(rawData), null, 2);
+  } catch (err) {
+    errorMsg = err.toString();
+    parsedJson = 'INVALID_JSON';
+  }
+
+  debugSheet.appendRow([timestamp, rawData.substring(0, 500), parsedJson.substring(0, 500), errorMsg]);
+
+  Logger.log("=== RAW REQUEST ===");
+  Logger.log("Timestamp: " + timestamp);
+  Logger.log("Raw data (first 1000 chars): " + rawData.substring(0, 1000));
+  if (errorMsg) Logger.log("Error: " + errorMsg);
+}
+
+/***** MAIN *****/
+function doPost(e) {
+  // Log crudo
+  logRawRequest(e);
+
+  if (typeof e === 'undefined') {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'error',
+      message: 'No request data'
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  const lock = LockService.getDocumentLock();
+  try {
+    lock.waitLock(30000);
+
+    const ss = getSpreadsheet_();
+    const fullSheet = ss.getSheetByName(FULL_SHEET_NAME) || ss.insertSheet(FULL_SHEET_NAME);
+
+    const raw = (e.postData && e.postData.contents) ? e.postData.contents : '{}';
+    Logger.log("Processing raw: " + raw.substring(0, 200));
+
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+      Logger.log("Parsed successfully");
+    } catch (parseErr) {
+      Logger.log("JSON parse error: " + parseErr);
+      payload = {};
+    }
+
+    Logger.log("Payload top keys: " + Object.keys(payload || {}).join(', '));
+
+    // --- Valores ---
+    let values = {};
+
+    // Caso 1: payload.values (TB estándar o custom)
+    if (payload && payload.values && typeof payload.values === 'object' && !Array.isArray(payload.values)) {
+      values = payload.values;
+      Logger.log("Caso 1: payload.values");
+    }
+    // Caso 2: Array telemetry
+    else if (Array.isArray(payload.telemetry)) {
+      Logger.log("Caso 2: payload.telemetry length=" + payload.telemetry.length);
+      if (payload.telemetry.length > 0) {
+        const last = payload.telemetry[payload.telemetry.length - 1];
+        values = (last && last.values && typeof last.values === 'object') ? last.values : {};
+      }
+    }
+    // Caso 3: payload.msg / payload.msg.values
+    else if (payload.msg && typeof payload.msg === 'object') {
+      Logger.log("Caso 3: payload.msg");
+      if (payload.msg.values && typeof payload.msg.values === 'object') values = payload.msg.values;
+      else values = payload.msg;
+    }
+    // Caso 4: plano (ej: ThingsBoard envía $values)
+    else {
+      Logger.log("Caso 4: payload plano (posible $values)");
+      values = payload;
+    }
+
+    Logger.log("Values keys: " + Object.keys(values).join(', '));
+
+    // --- Timestamps ---
+    const receivedMs = Date.now();
+    const receivedStr = Utilities.formatDate(new Date(receivedMs), "GMT-3", "yyyy-MM-dd HH:mm:ss");
+
+    // Buscar ts de evento en todo el payload (y dentro de values si existe)
+    const eventMs = extractEventTsMs_(payload);
+    const eventStr = eventMs
+      ? Utilities.formatDate(new Date(eventMs), "GMT-3", "yyyy-MM-dd HH:mm:ss")
+      : '';
+
+    Logger.log("EventMs detected: " + (eventMs || "NULL"));
+    Logger.log("ReceivedMs: " + receivedMs);
+
+    // --- Cabecera ---
+    const baseHeaders = ['Event_Timestamp', 'Event_Timestamp_ms', 'Received_Timestamp', 'Received_Timestamp_ms'];
+
+    if (fullSheet.getLastRow() === 0) {
+      const all = [...baseHeaders, ...Object.keys(values).sort()];
+      fullSheet.appendRow(all);
+      fullSheet.getRange(1, 1, 1, all.length).setFontWeight('bold');
+    } else {
+      const headers = fullSheet.getRange(1, 1, 1, fullSheet.getLastColumn()).getValues()[0];
+      const headerSet = {};
+      headers.forEach((h, i) => headerSet[h] = i);
+
+      // Asegurar headers base
+      const needBase = baseHeaders.filter(h => !headerSet.hasOwnProperty(h));
+      const newHeaders = [];
+
+      Object.keys(values).forEach(key => {
+        if (!headerSet.hasOwnProperty(key) && !baseHeaders.includes(key)) {
+          newHeaders.push(key);
+        }
+      });
+
+      if (needBase.length > 0 || newHeaders.length > 0) {
+        const updated = [...headers, ...needBase, ...newHeaders];
+        fullSheet.getRange(1, 1, 1, updated.length).setValues([updated]);
+        fullSheet.getRange(1, 1, 1, updated.length).setFontWeight('bold');
+      }
+    }
+
+    // --- Construir fila ---
+    const headers = fullSheet.getRange(1, 1, 1, fullSheet.getLastColumn()).getValues()[0];
+    const row = new Array(headers.length).fill('');
+
+    for (let i = 0; i < headers.length; i++) {
+      const h = headers[i];
+
+      if (h === 'Event_Timestamp') row[i] = eventStr;
+      else if (h === 'Event_Timestamp_ms') row[i] = eventMs || '';
+      else if (h === 'Received_Timestamp') row[i] = receivedStr;
+      else if (h === 'Received_Timestamp_ms') row[i] = receivedMs;
+      else if (values && Object.prototype.hasOwnProperty.call(values, h)) {
+        const v = values[h];
+        row[i] = (typeof v === 'object' && v !== null) ? JSON.stringify(v) : v;
+      }
+    }
+
+    fullSheet.appendRow(row);
+    Logger.log("Row written");
+
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'success',
+      event_timestamp_used: !!eventMs,
+      event_timestamp_ms: eventMs || null,
+      received_timestamp_ms: receivedMs,
+      values_count: Object.keys(values).length
+    })).setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    Logger.log("Error in doPost: " + err.stack);
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'error',
+      message: err.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/***** PRUEBAS *****/
+function testDoPostMultiple() {
+  // Test 1: TB estándar
+  const test1 = {
+    postData: {
+      contents: JSON.stringify({
+        ts: Date.now() - 300000,
+        values: { DI0: true, TempC: 45, Irms_A: 4.5, Funciona: true }
+      }),
+      type: "application/json"
+    }
+  };
+
+  // Test 2: seconds (10 dígitos)
+  const test2 = {
+    postData: {
+      contents: JSON.stringify({
+        ts: Math.floor((Date.now() - 600000) / 1000),
+        values: { DI0: false, TempC: 30, Irms_A: 3.2 }
+      }),
+      type: "application/json"
+    }
+  };
+
+  // Test 3: ts dentro de values
+  const test3 = {
+    postData: {
+      contents: JSON.stringify({
+        values: { event_ts_ms: Date.now() - 120000, DI1: 1, TempC: 28 }
+      }),
+      type: "application/json"
+    }
+  };
+
+  // Test 4: plano ($values) con event_ts_ms
+  const test4 = {
+    postData: {
+      contents: JSON.stringify({
+        event_ts_ms: Date.now() - 180000,
+        DI0: 1,
+        TempC: 25,
+        Irms_A: 0.0,
+        Funciona: false
+      }),
+      type: "application/json"
+    }
+  };
+
+  Logger.log("=== Test 1 ===");
+  Logger.log(doPost(test1).getContent());
+
+  Logger.log("=== Test 2 ===");
+  Logger.log(doPost(test2).getContent());
+
+  Logger.log("=== Test 3 ===");
+  Logger.log(doPost(test3).getContent());
+
+  Logger.log("=== Test 4 ===");
+  Logger.log(doPost(test4).getContent());
+
+  return "Tests completados";
+
+  
+}
+
+/***** POST-PROCESO: DETECTAR OFFLINE Y AJUSTAR HORAS *****/
+const COL_OFFLINE   = 'OFFLINE_FLAG';
+const COL_TS_AJUST  = 'TS_AJUSTADO';
+
+const TOL_ALIGN_MS = 2000;     // alineación normal
+const TH_BACKLOG_MS = 5000;    // diferencia grande => backlog
+const TH_OFFSET_JUMP_MS = 15000;
+
+function ajustarHorasPorMono() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(FULL_SHEET_NAME);
+  if (!sh) throw new Error('No existe la hoja: ' + FULL_SHEET_NAME);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2) return;
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(String);
+
+  // ✅ Usamos Received_Timestamp o Received_Timestamp_ms (tu hoja real)
+  const idxTs   = headers.indexOf('Received_Timestamp');
+  const idxTsMs = headers.indexOf('Received_Timestamp_ms');
+  const idxMono = headers.indexOf('mono_ms');
+
+  if (idxMono === -1) throw new Error('No encuentro columna mono_ms');
+  if (idxTs === -1 && idxTsMs === -1) {
+    throw new Error('No encuentro columna Received_Timestamp ni Received_Timestamp_ms');
+  }
+
+  let idxOffline = headers.indexOf(COL_OFFLINE);
+  let idxAdj     = headers.indexOf(COL_TS_AJUST);
+
+  const toAdd = [];
+  if (idxOffline === -1) toAdd.push(COL_OFFLINE);
+  if (idxAdj === -1)     toAdd.push(COL_TS_AJUST);
+
+  if (toAdd.length) {
+    sh.getRange(1, lastCol + 1, 1, toAdd.length).setValues([toAdd]);
+  }
+
+  const newHeaders = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+  idxOffline = newHeaders.indexOf(COL_OFFLINE);
+  idxAdj     = newHeaders.indexOf(COL_TS_AJUST);
+
+  const data = sh.getRange(2, 1, lastRow - 1, sh.getLastColumn()).getValues();
+
+  let lastRecvMs = null;
+  let lastMono   = null;
+  let offsetMs   = null;
+
+  const outOffline = [];
+  const outAdj     = [];
+
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+
+    // ✅ recv en ms: preferimos Received_Timestamp_ms si está
+    let recv = NaN;
+    if (idxTsMs !== -1 && row[idxTsMs] !== '' && row[idxTsMs] != null) {
+      recv = Number(row[idxTsMs]);
+    } else if (idxTs !== -1 && row[idxTs] instanceof Date) {
+      recv = row[idxTs].getTime();
+    }
+
+    const mono = Number(row[idxMono]);
+
+    let offline = false;
+    let adjMs = recv;
+
+    if (!isNaN(recv) && !isNaN(mono)) {
+      const thisOffset = recv - mono;
+
+      if (lastRecvMs !== null && lastMono !== null && mono >= lastMono) {
+        const dRecv = recv - lastRecvMs;
+        const dMono = mono - lastMono;
+
+        if ((dMono - dRecv) > TH_BACKLOG_MS) offline = true;
+        if (offsetMs !== null && Math.abs(thisOffset - offsetMs) > TH_OFFSET_JUMP_MS) offline = true;
+
+        if (Math.abs(dRecv - dMono) <= TOL_ALIGN_MS) {
+          offsetMs = offsetMs === null ? thisOffset : Math.round(0.8 * offsetMs + 0.2 * thisOffset);
+        }
+      } else if (lastMono !== null && mono < lastMono) {
+        offsetMs = null;
+        offline = true;
+      }
+
+      if (offsetMs !== null) adjMs = mono + offsetMs;
+    }
+
+    outOffline.push([offline ? 'TRUE' : 'FALSE']);
+    outAdj.push([!isNaN(adjMs) ? new Date(adjMs) : '']);
+
+    if (!isNaN(recv)) lastRecvMs = recv;
+    if (!isNaN(mono)) lastMono = mono;
+  }
+
+  sh.getRange(2, idxOffline + 1, outOffline.length, 1).setValues(outOffline);
+  sh.getRange(2, idxAdj + 1, outAdj.length, 1).setValues(outAdj);
+  sh.getRange(2, idxAdj + 1, outAdj.length, 1).setNumberFormat('yyyy-MM-dd HH:mm:ss');
+}
+
+
