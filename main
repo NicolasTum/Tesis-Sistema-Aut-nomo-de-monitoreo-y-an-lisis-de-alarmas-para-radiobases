@@ -16,11 +16,11 @@
 // ===== EMAIL ALERTS (ESP Mail Client) =====
 #include <ESP_Mail_Client.h>
 
-// ===== HTTP para leer routing desde Google Apps Script =====
+// ===== [NUEVO - MAIL] HTTP para leer routing desde Google Apps Script =====
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
-// ===== LittleFS para persistencia =====
+// ===== [NUEVO] LittleFS para persistencia =====
 #include <LittleFS.h>
 
 // ===== WiFi =====
@@ -30,7 +30,7 @@ const char* password = "asdasd123";
 // ===== LED ROJO indicador WiFi =====
 const int PIN_NET_ALERT_LED = 16;
 
-// ===== LED AZUL indicador Red =====
+// ===== LED AZUL indicador Red
 const int PIN_WIFI_LED = 4;
 
 // ===== ThingsBoard (MQTT) =====
@@ -114,7 +114,7 @@ const char* SITE_NAME = "Radiobase ORT";
 #define AUTHOR_PASSWORD "yuykewepcozzaqmy"
 #define RECIPIENT_EMAIL "tesismartineztumaian@gmail.com"  // fallback (Centro de Control)
 
-// ===== Routing por device_id vía Google Apps Script =====
+// ===== [NUEVO - MAIL] Routing por device_id vía Google Apps Script =====
 static const char* ROUTING_ENDPOINT =
   "https://script.google.com/macros/s/AKfycbwreMLL4dMnNDQ5paslx4tGlbHH0JOOmE42Iya5A3TsrW4RfDSkIbQQNrz1oOFz08rkkA/exec";
 
@@ -239,7 +239,7 @@ static bool fetchRoutingRecipients(bool force = false) {
   HTTPClient http;
   http.setTimeout(4000);
 
-  // ===== [MOD - MAIL] IMPORTANTE: seguir redirects =====
+  // ===== [MOD - MAIL] IMPORTANTE: seguir redirects (Apps Script suele responder 302) =====
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   if (!http.begin(client, url)) {
@@ -456,33 +456,47 @@ void enqueueEventWithCurrentTimestamp() {
 // Publicación con timestamp para ThingsBoard:
 // {"ts":..., "values":{...}}
 bool publishRecTB(const TelemetryRec& r) {
-  DynamicJsonDocument doc(768);
+  DynamicJsonDocument doc(1024);
 
-  // Usar el timestamp del evento (no el actual)
   if (r.ts_valid) {
-    doc["ts"] = (uint64_t)r.ts_ms;  // ✅ hora real del evento (ms)
+    doc["ts"] = (uint64_t)r.ts_ms;
   }
 
   JsonObject values = doc.createNestedObject("values");
-  values["ts_valid"] = r.ts_valid;
-  values["mono_ms"]  = (uint32_t)r.mono_ms;
+  values["ts_valid"]  = r.ts_valid;
+  values["mono_ms"]   = (uint32_t)r.mono_ms;
+  values["SITE_NAME"] = SITE_NAME;
+  values["DEVICE_ID"] = DEVICE_ID;
 
   for (int i = 0; i < 12; i++) {
     String key = "DI" + String(i);
     values[key] = ((r.diMask >> i) & 1);
   }
+
   values["TempC"]    = r.tempC;
   values["Irms_A"]   = r.irmsA;
   values["Funciona"] = r.funciona;
 
-  char payload[768];
+  char payload[1024];
   size_t n = serializeJson(doc, payload, sizeof(payload));
+
+  Serial.print("Payload size = ");
+  Serial.println(n);
+  Serial.print("MQTT connected = ");
+  Serial.println(mqttClient.connected() ? "YES" : "NO");
+  Serial.print("Payload = ");
+  Serial.println(payload);
+
   bool ok = mqttClient.publish("v1/devices/me/telemetry", payload, n);
 
   if (ok) {
     Serial.print("📤 TB OK (hist): ");
     Serial.print("ts=");
     Serial.print(r.ts_ms);
+    Serial.print(", SITE_NAME=");
+    Serial.print(SITE_NAME);
+    Serial.print(", DEVICE_ID=");
+    Serial.print(DEVICE_ID);
     Serial.print(", Temp=");
     Serial.print(r.tempC);
     Serial.print(", I=");
@@ -491,7 +505,10 @@ bool publishRecTB(const TelemetryRec& r) {
     Serial.println(r.funciona);
   } else {
     Serial.println("❌ publishRecTB falló");
+    Serial.print("mqttClient.state() = ");
+    Serial.println(mqttClient.state());
   }
+
   return ok;
 }
 
@@ -727,7 +744,7 @@ bool ensureMQTT() {
   return ok;
 }
 
-// ===== MOXA DI =====
+// ===== Helpers DI =====
 bool checkDIChangesOnly() {
   for (int i = 0; i < 12; i++) if (diStates[i] != lastDiStates[i]) return true;
   return false;
@@ -820,11 +837,11 @@ void computeCT() {
   }
 }
 
+// =====================================================
 
 void setup() {
   Serial.begin(115200);
   delay(200);
-
 // Al conectarnos asumismos que no hay internet, entonces prendemos LED ROJO
   pinMode(PIN_NET_ALERT_LED, OUTPUT);
   digitalWrite(PIN_NET_ALERT_LED, HIGH);
@@ -858,7 +875,7 @@ void setup() {
 
   // MQTT
   mqttClient.setServer(tb_server, tb_port);
-
+  mqttClient.setBufferSize(1024);
   // Modbus
   if (!mb.connect(moxaIP)) {
     Serial.println("❌ Falló conexión Modbus (se reintenta en loop)");
@@ -889,7 +906,7 @@ void setup() {
   mailConfig.login.password   = AUTHOR_PASSWORD;
   mailConfig.login.user_domain = "";
 
-
+  // NTP (Mail client lo usa, pero igual configuramos el sistema para time(nullptr))
   mailConfig.time.ntp_server       = F("pool.ntp.org,time.nist.gov");
   mailConfig.time.gmt_offset       = -3;
   mailConfig.time.day_light_offset = 0;
